@@ -1,5 +1,3 @@
-# Filename: optimal_investment_with_transaction_costs.py
-
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.interpolate import interp1d
