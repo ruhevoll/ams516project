@@ -13,19 +13,19 @@ Features:
 - 3×3 grid of:
     rows: FDM, PINN, PFNO
     cols: H(t=0,S,x), X_b(t,S), X_s(t,S)
+- Individual PNGs for each plot in the 3×3 grid
+- PNG of PINN training loss
+- 3D “volume” style visualization of no-trade region (PINN)
+- 3D plot with PINN buy & sell boundaries together
 - GIF animation of H(t,S,x) surfaces from t=0..1 (step 0.1) showing side-by-side
   FDM / PINN / PFNO.
-
-NOTE:
-- This is research-grade code. Hyperparameters (epochs, widths, etc.) will likely
-  need tuning for your use case and hardware.
-- Uses double precision and clipping to mitigate exponential overflow.
 """
 
 import numpy as np
 import math
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import torch
 import torch.nn as nn
 from torch.optim.lr_scheduler import ReduceLROnPlateau
@@ -407,7 +407,13 @@ def pinn_loss(pinn, bnet, n_int=4000, n_bc=2000, n_term=2000):
                torch.mean((H_sb_max - H_sb_max_target) ** 2)
 
     loss = loss_pde + loss_term + 0.1 * (loss_buy + loss_sell) + 0.01 * loss_sbd
-    return loss
+    return loss, {
+        "pde": loss_pde.item(),
+        "term": loss_term.item(),
+        "buy": loss_buy.item(),
+        "sell": loss_sell.item(),
+        "sbd": loss_sbd.item()
+    }
 
 
 def train_pinn():
@@ -418,15 +424,32 @@ def train_pinn():
     optimizer = torch.optim.Adam(params, lr=PINN_LR)
     scheduler = ReduceLROnPlateau(optimizer, factor=0.5, patience=500)
 
+    training_losses = []
+
     for epoch in range(1, PINN_EPOCHS + 1):
         optimizer.zero_grad()
-        loss = pinn_loss(pinn, bnet)
+        loss, logs = pinn_loss(pinn, bnet)
         loss.backward()
         optimizer.step()
         scheduler.step(loss.item())
+        training_losses.append(loss.item())
 
         if epoch % 500 == 0:
-            print(f"[PINN] Epoch {epoch:5d} | loss={loss.item():.3e}")
+            print(f"[PINN] Epoch {epoch:5d} | loss={loss.item():.3e} "
+                  f"| pde={logs['pde']:.3e} term={logs['term']:.3e} "
+                  f"buy={logs['buy']:.3e} sell={logs['sell']:.3e}")
+
+    # Plot and save training loss
+    plt.figure(figsize=(8,5))
+    plt.plot(training_losses)
+    plt.yscale("log")
+    plt.title("PINN Training Loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss (log scale)")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig("pinn_training_loss.png")
+    plt.close()
 
     return pinn, bnet
 
@@ -447,15 +470,7 @@ def evaluate_pinn_on_grid(pinn, bnet, t_eval=0.0, N_S_plot=60, N_x_plot=41):
         H_grid = pinn(t_t.flatten(), S_t.flatten(), x_t.flatten())
     H_grid = H_grid.view_as(S_t).cpu().numpy()
 
-    # boundaries vs S at this fixed t
-    ts = torch.tensor([[t_eval, s] for s in S_vals],
-                      dtype=torch.get_default_dtype(), device=device)
-    with torch.no_grad():
-        Xb_line, Xs_line = bnet(ts)
-    Xb_line = Xb_line.squeeze(-1).cpu().numpy()
-    Xs_line = Xs_line.squeeze(-1).cpu().numpy()
-
-    return S_vals, x_vals, H_grid, Xb_line, Xs_line
+    return S_vals, x_vals, H_grid
 
 
 def evaluate_pinn_boundaries_on_grid(bnet, N_t_plot=20, N_S_plot=50):
@@ -635,27 +650,22 @@ def pfno_loss(fno, coords, times_t, S_t, x_t):
     dt = times_t[1] - times_t[0]
     dS = S_t[1] - S_t[0]
 
-    # Finite differences for PDE residual:
-    # interior indices: time 1..Nt-2, S 1..Ns-2
     H = H_pred
 
-    # time derivative (central)
-    H_t = (H[2:, :, :] - H[:-2, :, :]) / (2.0 * dt)  # (Nt-2, Ns, Nx)
+    # time derivative (central): Nt-2, Ns, Nx
+    H_t = (H[2:, :, :] - H[:-2, :, :]) / (2.0 * dt)
 
-    # S derivatives (central)
-    H_S = (H[1:-1, 2:, :] - H[1:-1, :-2, :]) / (2.0 * dS)           # (Nt-2, Ns-2, Nx)
+    # S derivatives (central): use interior in S
+    H_S = (H[1:-1, 2:, :] - H[1:-1, :-2, :]) / (2.0 * dS)
     H_SS = (H[1:-1, 2:, :] - 2.0 * H[1:-1, 1:-1, :] + H[1:-1, :-2, :]) / (dS ** 2)
 
-    # S grid mid
     S_mid = S_t[1:-1].view(1, -1, 1)  # (1, Ns-2, 1)
-    # Align time dimension: 1..Nt-2
-    H_t_mid = H_t[:, 1:-1, :]  # (Nt-2, Ns-2, Nx)
+    H_t_mid = H_t[:, 1:-1, :]         # (Nt-2, Ns-2, Nx)
 
-    # PDE residual
     pde_res = H_t_mid + alpha * S_mid * H_S + 0.5 * sigma ** 2 * S_mid ** 2 * H_SS
     loss_pde = torch.mean(pde_res ** 2)
 
-    # Terminal condition at last time index (t = T)
+    # Terminal condition at t = T (last index)
     H_T = H[-1, :, :]  # (Ns, Nx)
     S_grid_T, x_grid_T = torch.meshgrid(S_t, x_t, indexing='ij')
     H_T_true = H_terminal_torch(S_grid_T, x_grid_T)
@@ -672,8 +682,6 @@ def train_pfno():
     optimizer = torch.optim.Adam(fno.parameters(), lr=PFNO_LR)
     scheduler = ReduceLROnPlateau(optimizer, factor=0.5, patience=300)
 
-    coords = coords  # (Nt, Ns, Nx, 3), on device
-
     for epoch in range(1, PFNO_EPOCHS + 1):
         optimizer.zero_grad()
         loss, H_pred = pfno_loss(fno, coords, times_t, S_t, x_t)
@@ -683,7 +691,6 @@ def train_pfno():
         if epoch % 500 == 0:
             print(f"[PFNO] Epoch {epoch:5d} | loss={loss.item():.3e}")
 
-    # Final prediction after training
     with torch.no_grad():
         H_final = fno(coords).cpu().numpy()
     return fno, H_final, t_vals_pfno, S_vals, x_vals
@@ -702,19 +709,6 @@ def plot_surface_on_ax(ax, X_vals, Y_vals, Z, title, xlabel, ylabel, zlabel):
     ax.set_zlabel(zlabel)
 
 
-def plot_boundary_surface(t_vals, S_vals, Xb, title):
-    T_grid, S_grid = np.meshgrid(t_vals, S_vals, indexing='ij')
-    fig = plt.figure()
-    ax = fig.add_subplot(111, projection='3d')
-    ax.plot_surface(T_grid, S_grid, Xb, cmap='plasma')
-    ax.set_title(title)
-    ax.set_xlabel("t")
-    ax.set_ylabel("S")
-    ax.set_zlabel("x")
-    plt.tight_layout()
-    plt.show()
-
-
 def make_3x3_grid(H0_fdm, Xb_fdm, Xs_fdm,
                   H0_pinn, Xb_pinn_3d, Xs_pinn_3d,
                   H0_pfno, Xb_pfno, Xs_pfno,
@@ -727,57 +721,73 @@ def make_3x3_grid(H0_fdm, Xb_fdm, Xs_fdm,
       Row 2: PINN  H0, Xb, Xs
       Row 3: PFNO  H0, Xb, Xs
     """
-    fig = plt.figure(figsize=(18, 12))
+    fig, axes = plt.subplots(3, 3, figsize=(18, 12),
+                             subplot_kw={'projection': '3d'})
 
     # Row 1: FDM
-    ax1 = fig.add_subplot(3, 3, 1, projection='3d')
-    plot_surface_on_ax(ax1, S_vals_fdm, x_vals_fdm, H0_fdm,
+    plot_surface_on_ax(axes[0,0], S_vals_fdm, x_vals_fdm, H0_fdm,
                        "FDM H(t=0,S,x)", "S", "x", "H")
-
-    ax2 = fig.add_subplot(3, 3, 2, projection='3d')
-    plot_surface_on_ax(ax2, t_vals_fdm, S_vals_fdm, Xb_fdm,
+    plot_surface_on_ax(axes[0,1], t_vals_fdm, S_vals_fdm, Xb_fdm,
                        "FDM X_b(t,S)", "t", "S", "x")
-
-    ax3 = fig.add_subplot(3, 3, 3, projection='3d')
-    plot_surface_on_ax(ax3, t_vals_fdm, S_vals_fdm, Xs_fdm,
+    plot_surface_on_ax(axes[0,2], t_vals_fdm, S_vals_fdm, Xs_fdm,
                        "FDM X_s(t,S)", "t", "S", "x")
 
     # Row 2: PINN
-    ax4 = fig.add_subplot(3, 3, 4, projection='3d')
-    plot_surface_on_ax(ax4, S_vals_fdm, x_vals_fdm, H0_pinn,
+    plot_surface_on_ax(axes[1,0], S_vals_fdm, x_vals_fdm, H0_pinn,
                        "PINN H(t=0,S,x)", "S", "x", "H")
-
-    ax5 = fig.add_subplot(3, 3, 5, projection='3d')
-    plot_surface_on_ax(ax5, t_vals_pinn, S_vals_pinn, Xb_pinn_3d,
+    plot_surface_on_ax(axes[1,1], t_vals_pinn, S_vals_pinn, Xb_pinn_3d,
                        "PINN X_b(t,S)", "t", "S", "x")
-
-    ax6 = fig.add_subplot(3, 3, 6, projection='3d')
-    plot_surface_on_ax(ax6, t_vals_pinn, S_vals_pinn, Xs_pinn_3d,
+    plot_surface_on_ax(axes[1,2], t_vals_pinn, S_vals_pinn, Xs_pinn_3d,
                        "PINN X_s(t,S)", "t", "S", "x")
 
     # Row 3: PFNO
-    ax7 = fig.add_subplot(3, 3, 7, projection='3d')
-    plot_surface_on_ax(ax7, S_vals_fdm, x_vals_fdm, H0_pfno,
+    plot_surface_on_ax(axes[2,0], S_vals_fdm, x_vals_fdm, H0_pfno,
                        "PFNO H(t=0,S,x)", "S", "x", "H")
-
-    ax8 = fig.add_subplot(3, 3, 8, projection='3d')
-    plot_surface_on_ax(ax8, t_vals_pfno, S_vals_pfno, Xb_pfno,
+    plot_surface_on_ax(axes[2,1], t_vals_pfno, S_vals_pfno, Xb_pfno,
                        "PFNO X_b(t,S)", "t", "S", "x")
-
-    ax9 = fig.add_subplot(3, 3, 9, projection='3d')
-    plot_surface_on_ax(ax9, t_vals_pfno, S_vals_pfno, Xs_pfno,
+    plot_surface_on_ax(axes[2,2], t_vals_pfno, S_vals_pfno, Xs_pfno,
                        "PFNO X_s(t,S)", "t", "S", "x")
 
     plt.tight_layout()
+    fig.savefig("comparison_3x3_grid.png")
     plt.show()
+    return fig, axes
 
 
-# ----------------------------------------------------------------------
-# GIF animation
-# ----------------------------------------------------------------------
+def save_individual_panels(H0_fdm, Xb_fdm, Xs_fdm,
+                           H0_pinn, Xb_pinn_3d, Xs_pinn_3d,
+                           H0_pfno, Xb_pfno, Xs_pfno,
+                           t_vals_fdm, S_vals_fdm, x_vals_fdm,
+                           t_vals_pinn, S_vals_pinn,
+                           t_vals_pfno, S_vals_pfno):
+    """
+    Re-generate each of the 3×3 grid plots individually and save as PNGs.
+    """
+    # Row 1: FDM
+    figs_info = [
+        ("FDM_H_t0", S_vals_fdm, x_vals_fdm, H0_fdm, "S", "x", "H"),
+        ("FDM_Xb", t_vals_fdm, S_vals_fdm, Xb_fdm, "t", "S", "x"),
+        ("FDM_Xs", t_vals_fdm, S_vals_fdm, Xs_fdm, "t", "S", "x"),
+        ("PINN_H_t0", S_vals_fdm, x_vals_fdm, H0_pinn, "S", "x", "H"),
+        ("PINN_Xb", t_vals_pinn, S_vals_pinn, Xb_pinn_3d, "t", "S", "x"),
+        ("PINN_Xs", t_vals_pinn, S_vals_pinn, Xs_pinn_3d, "t", "S", "x"),
+        ("PFNO_H_t0", S_vals_fdm, x_vals_fdm, H0_pfno, "S", "x", "H"),
+        ("PFNO_Xb", t_vals_pfno, S_vals_pfno, Xb_pfno, "t", "S", "x"),
+        ("PFNO_Xs", t_vals_pfno, S_vals_pfno, Xs_pfno, "t", "S", "x"),
+    ]
+
+    for name, X_vals, Y_vals, Z, xlabel, ylabel, zlabel in figs_info:
+        fig = plt.figure(figsize=(6, 5))
+        ax = fig.add_subplot(111, projection='3d')
+        plot_surface_on_ax(ax, X_vals, Y_vals, Z,
+                           name.replace("_", " "), xlabel, ylabel, zlabel)
+        plt.tight_layout()
+        fig.savefig(f"{name}.png")
+        plt.close(fig)
+
 
 def make_animation(H_fdm, t_vals_fdm, S_vals_fdm, x_vals_fdm,
-                   pinn, bnet,
+                   pinn,
                    H_pfno, t_vals_pfno,
                    filename=GIF_FILENAME, fps=GIF_FPS):
     """
@@ -791,18 +801,16 @@ def make_animation(H_fdm, t_vals_fdm, S_vals_fdm, x_vals_fdm,
     """
     frames = []
 
-    # We’ll use the PFNO time grid (t_vals_pfno), which in this setup is 0, 0.1, ..., 1
     times_anim = t_vals_pfno
-
     dt_fdm = t_vals_fdm[1] - t_vals_fdm[0]
 
     for idx_t, t in enumerate(times_anim):
-        # --- FDM: pick nearest time index ---
+        # FDM
         n_fdm = int(round(t / dt_fdm))
         n_fdm = max(0, min(n_fdm, len(t_vals_fdm) - 1))
-        H_fdm_t = H_fdm[n_fdm, :, :]  # (N_S, N_x)
+        H_fdm_t = H_fdm[n_fdm, :, :]
 
-        # --- PINN: evaluate on same (S,x) grid ---
+        # PINN
         S_grid, x_grid = np.meshgrid(S_vals_fdm, x_vals_fdm, indexing='ij')
         S_t = torch.as_tensor(S_grid, dtype=torch.get_default_dtype(), device=device)
         x_t = torch.as_tensor(x_grid, dtype=torch.get_default_dtype(), device=device)
@@ -811,44 +819,35 @@ def make_animation(H_fdm, t_vals_fdm, S_vals_fdm, x_vals_fdm,
             H_pinn_flat = pinn(t_t.flatten(), S_t.flatten(), x_t.flatten())
         H_pinn_t = H_pinn_flat.view_as(S_t).cpu().numpy()
 
-        # --- PFNO: H_pfno already on (t_idx, S, x) grid ---
-        # H_pfno has shape (N_t_pfno, N_S, N_x)
+        # PFNO
         H_pfno_t = H_pfno[idx_t, :, :]
 
-        # --- Build figure with 3 side-by-side subplots ---
         fig = plt.figure(figsize=(18, 5))
 
-        # Subplot 1: FDM
         ax1 = fig.add_subplot(1, 3, 1, projection='3d')
         plot_surface_on_ax(ax1, S_vals_fdm, x_vals_fdm, H_fdm_t,
                            f"FDM H(t={t:.2f})", "S", "x", "H")
 
-        # Subplot 2: PINN
         ax2 = fig.add_subplot(1, 3, 2, projection='3d')
         plot_surface_on_ax(ax2, S_vals_fdm, x_vals_fdm, H_pinn_t,
                            f"PINN H(t={t:.2f})", "S", "x", "H")
 
-        # Subplot 3: PFNO
         ax3 = fig.add_subplot(1, 3, 3, projection='3d')
         plot_surface_on_ax(ax3, S_vals_fdm, x_vals_fdm, H_pfno_t,
                            f"PFNO H(t={t:.2f})", "S", "x", "H")
 
         plt.tight_layout()
-
-        # --- Render to an image for the GIF ---
         fig.canvas.draw()
 
         try:
-            # Works for Agg and some other backends
             buf = fig.canvas.tostring_rgb()
             image = np.frombuffer(buf, dtype=np.uint8)
             image = image.reshape(fig.canvas.get_width_height()[::-1] + (3,))
         except Exception:
-            # Fallback for Qt backends that only have tostring_argb
             buf = fig.canvas.tostring_argb()
             arr = np.frombuffer(buf, dtype=np.uint8)
             arr = arr.reshape(fig.canvas.get_width_height()[::-1] + (4,))
-            image = arr[:, :, 1:4]  # drop alpha (ARGB -> RGB)
+            image = arr[:, :, 1:4]
 
         frames.append(image)
         plt.close(fig)
@@ -860,6 +859,59 @@ def make_animation(H_fdm, t_vals_fdm, S_vals_fdm, x_vals_fdm,
     print(f"GIF saved as {filename}")
 
 
+def plot_no_trade_volume(t_vals, S_vals, Xb, Xs, density=30):
+    """
+    Very approximate 3D visualization of no-trade region for PINN at t ≈ 0.
+    We visualize in (S,x) at t=0 as a filled band between Xb(0,S) and Xs(0,S).
+    """
+    idx_t = 0  # t=0 slice
+    S_grid = np.linspace(S_min, S_max, density)
+    Xb_interp = np.interp(S_grid, S_vals, Xb[idx_t])
+    Xs_interp = np.interp(S_grid, S_vals, Xs[idx_t])
+
+    fig = plt.figure(figsize=(8, 6))
+    ax = fig.add_subplot(111, projection='3d')
+
+    verts = []
+    for k in range(len(S_grid)-1):
+        verts.append([
+            (S_grid[k], Xb_interp[k], 0),
+            (S_grid[k+1], Xb_interp[k+1], 0),
+            (S_grid[k+1], Xs_interp[k+1], 0),
+            (S_grid[k], Xs_interp[k], 0),
+        ])
+
+    volume = Poly3DCollection(verts, alpha=0.3)
+    volume.set_facecolor('cyan')
+    ax.add_collection3d(volume)
+
+    ax.plot(S_vals, Xb[idx_t], zs=0, label="Buy Boundary")
+    ax.plot(S_vals, Xs[idx_t], zs=0, label="Sell Boundary")
+
+    ax.set_title("PINN No-Trade Region Volume (t=0)")
+    ax.set_xlabel("S")
+    ax.set_ylabel("x")
+    ax.set_zlabel("t (fixed at 0)")
+    plt.tight_layout()
+    plt.savefig("pinn_no_trade_volume.png")
+    plt.close(fig)
+
+
+def plot_combined_boundaries(t_vals, S_vals, Xb_vals, Xs_vals):
+    T_grid, S_grid = np.meshgrid(t_vals, S_vals, indexing="ij")
+    fig = plt.figure(figsize=(8, 6))
+    ax = fig.add_subplot(111, projection='3d')
+
+    ax.plot_surface(T_grid, S_grid, Xb_vals, cmap='viridis', alpha=0.6)
+    ax.plot_surface(T_grid, S_grid, Xs_vals, cmap='plasma', alpha=0.6)
+
+    ax.set_title("PINN Buy & Sell Boundaries")
+    ax.set_xlabel("t")
+    ax.set_ylabel("S")
+    ax.set_zlabel("x")
+    plt.tight_layout()
+    fig.savefig("pinn_combined_boundaries.png")
+    plt.close(fig)
 
 
 # ----------------------------------------------------------------------
@@ -876,7 +928,7 @@ def main():
     # ---------------- PINN ----------------
     print("=== PINN training ===")
     pinn, bnet = train_pinn()
-    S_vals_pinn0, x_vals_pinn0, H0_pinn, _, _ = evaluate_pinn_on_grid(
+    S_vals_pinn0, x_vals_pinn0, H0_pinn = evaluate_pinn_on_grid(
         pinn, bnet, t_eval=0.0,
         N_S_plot=len(S_vals_fdm),
         N_x_plot=len(x_vals_fdm)
@@ -888,23 +940,36 @@ def main():
     # ---------------- PFNO (physics-informed FNO) ----------------
     print("=== PFNO training (physics-informed FNO) ===")
     pfno, H_pfno, t_vals_pfno, S_vals_pfno, x_vals_pfno = train_pfno()
-    # H_pfno shape: (N_t_pfno, N_S, N_x)
     H0_pfno = H_pfno[0, :, :]
     Xb_pfno, Xs_pfno = extract_boundaries_from_H(H_pfno, t_vals_pfno, S_vals_pfno, x_vals_pfno)
 
     # ---------------- 3x3 grid ----------------
     print("=== Producing 3×3 comparison grid ===")
-    make_3x3_grid(H0_fdm, Xb_fdm, Xs_fdm,
-                  H0_pinn, Xb_pinn_3d, Xs_pinn_3d,
-                  H0_pfno, Xb_pfno, Xs_pfno,
-                  t_vals, S_vals_fdm, x_vals_fdm,
-                  t_vals_pinn, S_vals_pinn,
-                  t_vals_pfno, S_vals_pfno)
+    fig, axes = make_3x3_grid(H0_fdm, Xb_fdm, Xs_fdm,
+                              H0_pinn, Xb_pinn_3d, Xs_pinn_3d,
+                              H0_pfno, Xb_pfno, Xs_pfno,
+                              t_vals, S_vals_fdm, x_vals_fdm,
+                              t_vals_pinn, S_vals_pinn,
+                              t_vals_pfno, S_vals_pfno)
+
+    # ---------------- Individual PNGs for each panel ----------------
+    print("=== Saving individual PNGs for each 3×3 panel ===")
+    save_individual_panels(H0_fdm, Xb_fdm, Xs_fdm,
+                           H0_pinn, Xb_pinn_3d, Xs_pinn_3d,
+                           H0_pfno, Xb_pfno, Xs_pfno,
+                           t_vals, S_vals_fdm, x_vals_fdm,
+                           t_vals_pinn, S_vals_pinn,
+                           t_vals_pfno, S_vals_pfno)
+
+    # ---------------- No-trade volume & combined boundaries (PINN) ----
+    print("=== Plotting PINN no-trade volume & combined boundaries ===")
+    plot_no_trade_volume(t_vals_pinn, S_vals_pinn, Xb_pinn_3d, Xs_pinn_3d)
+    plot_combined_boundaries(t_vals_pinn, S_vals_pinn, Xb_pinn_3d, Xs_pinn_3d)
 
     # ---------------- GIF animation ----------------
     print("=== Producing GIF animation of H(t,S,x) for FDM, PINN, PFNO ===")
     make_animation(H_fdm, t_vals, S_vals_fdm, x_vals_fdm,
-                   pinn, bnet,
+                   pinn,
                    H_pfno, t_vals_pfno,
                    filename=GIF_FILENAME, fps=GIF_FPS)
 
